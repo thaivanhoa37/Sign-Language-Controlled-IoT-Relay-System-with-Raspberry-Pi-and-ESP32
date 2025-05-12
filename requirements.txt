@@ -1,0 +1,14 @@
+Cài đặt OpenCV qua apt:
+  sudo apt update
+  sudo apt install -y python3-opencv
+Sau khi cài đặt, kiểm tra xem OpenCV đã được cài đặt thành công chưa:
+   python3 -c "import cv2; print(cv2.__version__)"
+ cài đặt MediaPipe:
+    pip install mediapipe --break-system-packages
+ Kiểm tra cài đặt: Sau khi cài đặt, kiểm tra xem MediaPipe đã được cài đặt thành công chưa:
+    python3 -c "import mediapipe as mp; print(mp.__version__)"
+Cài đặt scikit-learn:
+    pip install scikit-learn --break-system-packages     
+
+Sau khi cài đặt, kiểm tra xem scikit-learn đã được cài đặt thành công chưa:
+    python3 -c "import sklearn; print(sklearn.__version__)"         
