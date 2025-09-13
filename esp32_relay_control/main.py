@@ -1,167 +1,239 @@
-from machine import Pin, I2C
+from machine import Pin
 import network
 import time
-from umqtt.simple import MQTTClient
+from umqtt.robust import MQTTClient
 import random
-import ssd1306
+import gc
 
 # WiFi credentials
 SSID = "vanhoa"
 PASSWORD = "11111111"
 
 # MQTT Broker settings
-MQTT_SERVER = "192.168.137.241"
-MQTT_USERNAME = ""
-MQTT_PASSWORD = ""
+MQTT_SERVER = "192.168.137.127"  # Pi's IP address
 MQTT_PORT = 1883
+MQTT_KEEPALIVE = 30
+
+# MQTT Topics
 MQTT_TOPIC_RELAY1 = b"home/relay1"
 MQTT_TOPIC_RELAY2 = b"home/relay2"
 MQTT_STATUS_RELAY1 = b"home/relay1/status"
 MQTT_STATUS_RELAY2 = b"home/relay2/status"
+MQTT_LWT_TOPIC = b"home/esp32/status"
 
 # Pin configuration
-RELAY1_PIN = Pin(26, Pin.OUT)  # GPIO26
-RELAY2_PIN = Pin(27, Pin.OUT)  # GPIO27
-LED1_PIN = Pin(2, Pin.OUT)     # Built-in LED
-LED2_PIN = Pin(25, Pin.OUT)    # Changed to GPIO25 for External LED
+RELAY1_PIN = 26  # GPIO26
+RELAY2_PIN = 27  # GPIO27
+LED1_PIN = 2     # Built-in LED
+LED2_PIN = 4     # External LED
 
-# State tracking
+# Initialize pins
+relay1 = Pin(RELAY1_PIN, Pin.OUT)
+relay2 = Pin(RELAY2_PIN, Pin.OUT)
+led1 = Pin(LED1_PIN, Pin.OUT)
+led2 = Pin(LED2_PIN, Pin.OUT)
+
+# Global variables
+client = None
+last_mqtt_check = 0
+MQTT_CHECK_INTERVAL = 5000  # 5 seconds
+mqtt_connected = False
+
+# Initialize state
 relay1_state = False
 relay2_state = False
 
-def setup_wifi():
+def blink_led(led, times=1):
+    """Blink LED to indicate status"""
+    for _ in range(times):
+        led.value(1)
+        time.sleep_ms(100)
+        led.value(0)
+        time.sleep_ms(100)
+
+def get_wifi_status():
+    """Get WiFi connection status and IP"""
     wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
-    print("Kết nối WiFi...")
-    
-    if not wlan.isconnected():
-        wlan.connect(SSID, PASSWORD)
-        while not wlan.isconnected():
-            time.sleep(0.5)
-            print(".", end="")
-    
-    print("\nĐã kết nối WiFi")
-    print("IP:", wlan.ifconfig()[0])
-    return wlan
+    if wlan.isconnected():
+        return True, wlan.ifconfig()[0]
+    return False, None
 
-def update_relay(pin, led_pin, state, status_topic, new_state):
+def ensure_wifi_connected():
+    """Ensure WiFi is connected before proceeding"""
+    wifi_connected, ip = get_wifi_status()
+    if not wifi_connected:
+        print("WiFi not connected. Please check boot.py configuration.")
+        blink_led(led1, 5)
+        return False
+    print(f"WiFi connected, IP: {ip}")
+    return True
+
+def create_mqtt_client():
+    """Create and configure MQTT client"""
+    global client
+    client_id = f"ESP32Client-{random.getrandbits(16):04x}"
+    
+    try:
+        client = MQTTClient(client_id, MQTT_SERVER,
+                          port=MQTT_PORT,
+                          keepalive=MQTT_KEEPALIVE)
+        
+        client.set_last_will(MQTT_LWT_TOPIC, b"offline", retain=True)
+        client.set_callback(mqtt_callback)
+        
+        return client
+    except Exception as e:
+        print(f"Error creating MQTT client: {e}")
+        return None
+
+def mqtt_callback(topic, msg):
+    """Handle incoming MQTT messages"""
+    try:
+        topic = topic.decode('utf-8')
+        msg = msg.decode('utf-8')
+        print(f"Received message on {topic}: {msg}")
+        
+        new_state = (msg == "ON")
+        
+        if topic == MQTT_TOPIC_RELAY1.decode():
+            update_relay(relay1, led1, "relay1_state", MQTT_STATUS_RELAY1, new_state)
+            blink_led(led2)
+        elif topic == MQTT_TOPIC_RELAY2.decode():
+            update_relay(relay2, led2, "relay2_state", MQTT_STATUS_RELAY2, new_state)
+            blink_led(led2)
+    except Exception as e:
+        print(f"Error in callback: {e}")
+        blink_led(led1, 3)
+
+def update_relay(pin, led_pin, state_var, status_topic, new_state):
+    """Update relay state and publish status"""
     global relay1_state, relay2_state
-    if status_topic == MQTT_STATUS_RELAY1:
-        relay1_state = new_state
-    else:
-        relay2_state = new_state
     
-    pin.value(1 if new_state else 0)
-    led_pin.value(1 if new_state else 0)
-    client.publish(status_topic, b"ON" if new_state else b"OFF", retain=True)
-    print(f"Cập nhật trạng thái: {status_topic.decode()} -> {'ON' if new_state else 'OFF'}")
-
-def callback(topic, msg):
-    message = msg.decode()
-    new_state = (message == "ON")
-    
-    if topic == MQTT_TOPIC_RELAY1:
-        update_relay(RELAY1_PIN, LED1_PIN, relay1_state, MQTT_STATUS_RELAY1, new_state)
-    elif topic == MQTT_TOPIC_RELAY2:
-        update_relay(RELAY2_PIN, LED2_PIN, relay2_state, MQTT_STATUS_RELAY2, new_state)
+    try:
+        # Update state
+        if state_var == "relay1_state":
+            relay1_state = new_state
+        else:
+            relay2_state = new_state
+        
+        # Set pin values
+        pin.value(1 if new_state else 0)
+        led_pin.value(1 if new_state else 0)
+        
+        # Publish status
+        if client and mqtt_connected:
+            client.publish(status_topic, b"ON" if new_state else b"OFF", retain=True)
+            print(f"Published status: {status_topic.decode()} -> {'ON' if new_state else 'OFF'}")
+    except Exception as e:
+        print(f"Error updating relay: {e}")
+        blink_led(led1, 3)
 
 def connect_mqtt():
-    client_id = f"ESP32Client-{random.getrandbits(16):04x}"
-    client = MQTTClient(client_id, MQTT_SERVER, MQTT_PORT, MQTT_USERNAME, MQTT_PASSWORD)
-    client.set_callback(callback)
+    """Connect to MQTT broker with error handling"""
+    global client, mqtt_connected
+    
+    # Check WiFi first
+    if not ensure_wifi_connected():
+        return False
+    
+    try:
+        print(f"Connecting to MQTT broker at {MQTT_SERVER}...")
+        
+        if client:
+            try:
+                client.disconnect()
+            except:
+                pass
+        
+        client = create_mqtt_client()
+        if not client:
+            return False
+        
+        client.connect()
+        print("MQTT Connected")
+        
+        # Subscribe to topics
+        client.subscribe(MQTT_TOPIC_RELAY1)
+        client.subscribe(MQTT_TOPIC_RELAY2)
+        
+        # Publish online status
+        client.publish(MQTT_LWT_TOPIC, b"online", retain=True)
+        
+        # Publish initial states
+        client.publish(MQTT_STATUS_RELAY1, b"OFF" if not relay1_state else b"ON", retain=True)
+        client.publish(MQTT_STATUS_RELAY2, b"OFF" if not relay2_state else b"ON", retain=True)
+        
+        mqtt_connected = True
+        blink_led(led2, 2)
+        return True
+        
+    except Exception as e:
+        mqtt_connected = False
+        print(f"MQTT Connection failed: {e}")
+        blink_led(led1, 3)
+        return False
+
+def main():
+    """Main program loop"""
+    global client, mqtt_connected, last_mqtt_check
+    
+    print("Initializing...")
+    
+    # Initialize hardware
+    relay1.value(0)
+    relay2.value(0)
+    led1.value(0)
+    led2.value(0)
+    
+    # Ensure WiFi is connected
+    if not ensure_wifi_connected():
+        print("Cannot proceed without WiFi connection")
+        while True:
+            blink_led(led1, 2)
+            time.sleep(1)
+    
+    print("WiFi connection verified")
+    time.sleep(1)  # Wait a bit before MQTT connection
+    
+    # Initial MQTT connection
+    while not connect_mqtt():
+        print("Retrying MQTT connection in 5 seconds...")
+        time.sleep(5)
+    
+    print("Setup complete, entering main loop")
     
     while True:
         try:
-            client.connect()
-            print("Kết nối MQTT thành công")
+            current_time = time.ticks_ms()
             
-            # Subscribe to control topics
-            client.subscribe(MQTT_TOPIC_RELAY1)
-            client.subscribe(MQTT_TOPIC_RELAY2)
+            # Check WiFi and MQTT connection status periodically
+            if time.ticks_diff(current_time, last_mqtt_check) >= MQTT_CHECK_INTERVAL:
+                wifi_connected, _ = get_wifi_status()
+                
+                if not wifi_connected:
+                    print("WiFi disconnected!")
+                    mqtt_connected = False
+                    blink_led(led1)
+                elif not mqtt_connected:
+                    print("Attempting MQTT reconnection...")
+                    connect_mqtt()
+                
+                last_mqtt_check = current_time
             
-            # Publish initial states
-            client.publish(MQTT_STATUS_RELAY1, b"OFF", retain=True)
-            client.publish(MQTT_STATUS_RELAY2, b"OFF", retain=True)
-            break
+            if mqtt_connected:
+                # Check for MQTT messages
+                client.check_msg()
+                
+                # Memory management
+                gc.collect()
+            
+            time.sleep_ms(100)
             
         except Exception as e:
-            print("Kết nối thất bại, lỗi =", e)
-            print("Thử lại sau 5 giây")
+            print(f"Error in main loop: {e}")
+            mqtt_connected = False
+            blink_led(led1, 3)
             time.sleep(5)
-    
-    return client
 
-# Initialize I2C and OLED
-try:
-    i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=100000)  # Lower frequency, standard pins
-    devices = i2c.scan()
-    if devices:
-        print("I2C devices found:", [hex(device) for device in devices])
-        oled = ssd1306.SSD1306_I2C(128, 64, i2c)
-        oled_available = True
-    else:
-        print("No I2C devices found")
-        oled_available = False
-except Exception as e:
-    print("Error initializing I2C:", e)
-    oled_available = False
-
-def update_display():
-    if not oled_available:
-        return
-    oled.fill(0)  # Clear display
-    
-    # WiFi Status
-    oled.text("WiFi: " + ("Connected" if wlan.isconnected() else "Disconnected"), 0, 0)
-    if wlan.isconnected():
-        oled.text("IP: " + wlan.ifconfig()[0], 0, 10)
-    
-    # MQTT Status
-    try:
-        client.ping()
-        mqtt_status = "Connected"
-    except:
-        mqtt_status = "Disconnected"
-    oled.text("MQTT: " + mqtt_status, 0, 25)
-    
-    # Relay States
-    oled.text("Relay1: " + ("ON" if relay1_state else "OFF"), 0, 40)
-    oled.text("Relay2: " + ("ON" if relay2_state else "OFF"), 0, 50)
-    
-    oled.show()
-
-# Initialize hardware
-RELAY1_PIN.value(0)
-RELAY2_PIN.value(0)
-LED1_PIN.value(0)
-LED2_PIN.value(0)
-
-# Connect to network
-wlan = setup_wifi()
-client = connect_mqtt()
-
-# Main loop
-while True:
-    try:
-        client.check_msg()
-        
-        # Update OLED display if available
-        if oled_available:
-            update_display()
-        
-        # Visual feedback through built-in LED
-        if not wlan.isconnected():
-            LED1_PIN.value(1)
-            time.sleep(0.1)
-            LED1_PIN.value(0)
-            time.sleep(0.1)
-            
-            # Attempt to reconnect WiFi
-            wlan = setup_wifi()
-            
-        time.sleep(0.1)  # Small delay to prevent busy waiting
-        
-    except Exception as e:
-        print("Error:", e)
-        # Attempt to reconnect MQTT
-        client = connect_mqtt()
+if __name__ == "__main__":
+    main()
